@@ -1,0 +1,7 @@
+results/
+*.npy
+*.pdf
+!paper/*.pdf
+__pycache__/
+.ipynb_checkpoints/
+credit_score_data.csv
