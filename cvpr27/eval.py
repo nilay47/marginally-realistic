@@ -24,6 +24,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from cvpr27 import benchmark as bm
 from cvpr27 import evalmetrics as em
 from cvpr27 import physvid as pv
 from cvpr27.common import atomic_json, drive_root, fmt_s, git_info, new_path
@@ -293,6 +294,10 @@ def main(argv=None):
     print(f"E6 done ({fmt_s(time.time() - t0)})")
     e7res = e7(ref, draws[0], arr0, seed=6)
 
+    # ---------------- E8: consistent time reversal of REAL clips (real data only; reference of the metric is restored)
+    e8res = bm.e8_time_reversal(held, norm, metric, B=a.B, device=dev, n=64 if a.smoke else 1024)
+    print(f"E8 done ({fmt_s(time.time() - t0)})")
+
     # ---------------- go / no-go flags (spec section 6), computed
     j = recs[0]["joint"]["physical"]
     near = {k: j[k]["median"] / max(ref.floor[k]["median"], 1e-12) for k in PHYS}
@@ -311,7 +316,7 @@ def main(argv=None):
            "video_metric": None if metric is None else {"name": metric.name, "kind": metric.kind, "flavor": metric.flavor},
            "runs": {k: {"run": m["run"], "ckpt": m["ckpt"]} for k, m in models.items()},
            "floors": floors, "draws": recs, "bootstrap_ci_main_draw": boot, "spread_over_draws": spread,
-           "E4_gaps": gaps, "E3_ratio_curve": e3, "E6_sample_efficiency": e6res, "E7_auroc": e7res,
+           "E4_gaps": gaps, "E3_ratio_curve": e3, "E6_sample_efficiency": e6res, "E7_auroc": e7res, "E8_time_reversal": e8res,
            "go_no_go": gng, "E2_curve_files": [str(jr.name)], "seconds": time.time() - t0}
     atomic_json(out_dir / "results.json", res)
     write_markdown(out_dir, res)
@@ -362,6 +367,7 @@ def write_markdown(out_dir: Path, r: dict):
         md.append(f"- {k}: {d['min_n_for_p95']}")
     md += ["", "## E7 AUROC (real held-out = negatives; larger score = more impossible)", "", "| positives | " + " | ".join(PHYS + ["r_energy_win_med", "kin_rad_med"]) + " |", "|---|---|---|---|---|---|"]
     md += [f"| {p} | " + " | ".join(fmt(x[k], 3) for k in PHYS + ["r_energy_win_med", "kin_rad_med"]) + " |" for p, x in r["E7_auroc"].items()]
+    md += [""] + bm.e8_markdown(r["E8_time_reversal"])
     md += ["", "## Go / no-go flags (spec section 6, computed)", "", "```", json.dumps(r["go_no_go"], indent=1, default=float), "```"]
     new_path(out_dir / "results.md").write_text("\n".join(md) + "\n")
 

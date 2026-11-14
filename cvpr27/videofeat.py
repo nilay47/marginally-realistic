@@ -161,6 +161,13 @@ class VideoMetric:
             tmp = key.with_name(key.stem + ".tmp.npy")
             np.save(tmp, f)
             tmp.rename(key)
+        self._install_ref(f)
+
+    def set_reference_nocache(self, real_u8):
+        """Reference from an arbitrary clip set (e.g. a held-out half); never touches the on-disk feature cache."""
+        self._install_ref(self.ext.features(real_u8))
+
+    def _install_ref(self, f):
         self.ref = {"feats": f}
         if self.kind == "fvd":
             self.ref["mu"], self.ref["cov"] = f.mean(0), np.cov(f, rowvar=False)

@@ -146,6 +146,26 @@ for p in sorted(glob.glob(f"{ROOT}/eval_main/figures/*.png")):
     ]
 
 
+def nb6():
+    return [
+        md(f"{badge('nb6_e8_time_reversal')}\n\n# nb6: E8, does each metric detect time reversal of real clips?\n"
+           "Real held-out data only (**no trained models needed**), so it can run as soon as nb0 has finished. Conditions: `real_vs_real` (baseline), "
+           "`time_reversed` (video reversed, gyro reversed and negated, torque reversed), `video_reversed_only`. Reports the video metric (FVD) with "
+           "bootstrap CIs, W1, MMD and the three physics diagnostics, plus per-sample AUROC. The same E8 block is also written by nb4 into results.md. "
+           "Writes new files `eval_<tag>/e8.json` and `e8.md`."),
+        md("## 1. GPU"), GPU, md("## 2. Drive"), DRIVE, md("## 3. Code"), CLONE, md("## 4. Install"), INSTALL,
+        md("## 5. Check nb0 outputs"),
+        code('''
+import os
+for f in ["cache/pendulum_T64_dt0.04_train.npz", "cache/pendulum_T64_dt0.04_heldout.npz", "cache/video_metric.json"]:
+    assert os.path.exists(f"{ROOT}/{f}"), f"missing {f}: run nb0_benchmark first"
+print("nb0 outputs present")
+'''),
+        md("## 6. Run E8 (use a new `--tag` to rerun; nothing is overwritten)"),
+        code('!cd /content/repo && python -u -m cvpr27.benchmark --e8 --tag e8'),
+    ]
+
+
 def nb5():
     cells = [
         md(f"{badge('nb5_train_joint_seeds')}\n\n# nb5: joint model, seeds 1 and 2 (optional)\nTrains `joint_s1` and `joint_s2` exactly as "
@@ -187,6 +207,7 @@ def main():
         "nb2_train_video_only": train_nb("nb2_train_video_only", "nb2: train the video-only model", "video_only", "video_only_s0"),
         "nb4_eval": nb4(),
         "nb5_train_joint_seeds": nb5(),
+        "nb6_e8_time_reversal": nb6(),
         "nb3_train_sensor_only": train_nb("nb3_train_sensor_only", "nb3: train the sensor-only model", "sensor_only", "sensor_only_s0",
                                           "Cheap (4x4 planes)."),
     }

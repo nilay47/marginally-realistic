@@ -108,5 +108,136 @@ def run():
     return res
 
 
+# ------------------------------------------------------------------ E8: time reversal
+E8_DIAG = KEYS + ["r_energy_win_med", "kin_rad_med"]
+
+
+def time_reverse(vid, om, tau, video_only=False):
+    """Reverse the clip in time. Full reversal: frames reversed, gyro reversed AND negated (omega = dtheta/dt flips
+    sign), torque reversed. video_only=True: reverse only the video and leave the sensors forward."""
+    v = np.ascontiguousarray(vid[:, ::-1])
+    if video_only:
+        return v, om, tau
+    return v, -np.ascontiguousarray(om[:, ::-1]), np.ascontiguousarray(tau[:, ::-1])
+
+
+def _ci(fn, n, B, rng):
+    v = np.array([fn(rng.integers(0, n, n)) for _ in range(B)])
+    return [float(np.percentile(v, 2.5)), float(np.percentile(v, 97.5))]
+
+
+def e8_time_reversal(held, norm, metric=None, B=200, seed=8, device="cpu", n=1024) -> dict:
+    """E8: does each metric detect CONSISTENT time reversal of real clips? Needs real data only (no trained models).
+
+    Split the held-out set into disjoint halves A (n clips, source of the test clips) and R (reference, n clips).
+    Conditions: real_A (baseline: real vs real), time_reversed, video_reversed_only. All compared with R, so every
+    number has the same n and no clip is on both sides. FVD/KID, W1, MMD and the physics medians get 95% bootstrap
+    CIs over the test clips (B draws); AUROC is real R (negatives) vs the condition (positives). The video metric is
+    skipped when metric is None (CPU smoke test). The reference of `metric` is replaced here and restored on exit."""
+    rng = np.random.default_rng(seed)
+    perm = np.random.default_rng(seed).permutation(len(held["video"]))
+    n = min(n, len(perm) // 2)
+    iA, iR = perm[:n], perm[n:2 * n]
+    g = lambda i: (held["video"][i], held["omega"][i].astype(np.float64), held["tau"][i].astype(np.float64))
+    real_R, real_A = g(iR), g(iA)
+    conds = {"real_vs_real": real_A, "time_reversed": time_reverse(*real_A),
+             "video_reversed_only": time_reverse(*real_A, video_only=True)}
+    per_R = em.score_clips(*real_R)
+    mmd_R = em.mmd_features(*real_R, norm)
+    old_ref = None
+    if metric is not None:
+        old_ref = metric.ref
+        metric.set_reference_nocache(real_R[0])
+    out = {"n": int(n), "B": B, "split": {"reference_R": "held-out half R", "test": "disjoint held-out half A (reversed or not)"},
+           "video_metric": None if metric is None else {"name": metric.name, "kind": metric.kind, "flavor": metric.flavor},
+           "conditions": {}}
+    try:
+        for name, (v, om, tau) in conds.items():
+            r = {}
+            per = em.score_clips(v, om, tau)
+            r["physical"] = em.summarise(per)
+            r["physical_ci"] = {k: [float(np.median(per[k]))] + _ci(lambda i, k=k: np.median(per[k][i]), n, B, rng)
+                                for k in E8_DIAG}
+            r["invalid_frame_frac"] = r["physical"]["invalid_frame_frac"]
+            w = em.sensor_w1(real_R[1], real_R[2], om, tau)
+            r["w1_mean"] = w["w1_mean"]
+            r["w1_mean_ci"] = _ci(lambda i: em.sensor_w1(real_R[1], real_R[2], om[i], tau[i])["w1_mean"], n, B, rng)
+            pool = em.MMDPool(mmd_R, em.mmd_features(v, om, tau, norm), device)
+            ar, ref_idx = np.arange(n), np.arange(n)
+            r["mmd"] = pool.mmd2(ar, ref_idx)
+            r["mmd_ci"] = _ci(lambda i: pool.mmd2(i, ref_idx), n, B, rng)
+            if metric is not None:
+                p = metric.prep(v)
+                r["video_metric"] = float(metric.value(p))
+                em.check_finite("video_metric", r["video_metric"])
+                r["video_metric_ci"] = _ci(lambda i: metric.value(p, i), n, B, rng)
+            if name != "real_vs_real":
+                r["auroc_vs_real"] = {k: em.auroc(per_R[k], per[k]) for k in E8_DIAG}
+            out["conditions"][name] = r
+    finally:
+        if metric is not None:
+            metric.ref = old_ref
+    base = out["conditions"]["real_vs_real"]
+    if metric is not None:
+        for name in ("time_reversed", "video_reversed_only"):
+            c = out["conditions"][name]
+            c["video_metric_over_real_baseline"] = c["video_metric"] / max(base["video_metric"], 1e-12)
+            c["video_metric_ci_disjoint_from_baseline"] = bool(c["video_metric_ci"][0] > base["video_metric_ci"][1])
+    return out
+
+
+def e8_markdown(r: dict) -> list:
+    f = lambda x: "n/a" if x is None else (f"{x:.3g}" if abs(x) >= 1e-3 or x == 0 else f"{x:.2e}")
+    ci = lambda x, c: f"{f(x)} [{f(c[0])}, {f(c[1])}]"
+    vm = r["video_metric"]["name"] if r["video_metric"] else None
+    md = ["## E8: consistent time reversal of real clips", "",
+          f"Test clips: held-out half A (n={r['n']}), compared with the disjoint held-out half R. `real_vs_real` is the baseline "
+          "(half A unmodified). `time_reversed`: frames reversed, gyro reversed and negated, torque reversed (all modalities consistent). "
+          f"`video_reversed_only`: video reversed, sensors forward. Values: point [95% bootstrap CI over test clips, B={r['B']}].", "",
+          "| condition | " + (f"{vm} | " if vm else "") + "W1 | MMD² | r_energy | win_max | kin_max (rad) |", "|---|" + "---|" * (5 + bool(vm))]
+    for name, c in r["conditions"].items():
+        pc = c["physical_ci"]
+        cells = ([ci(c["video_metric"], c["video_metric_ci"])] if vm else []) + [ci(c["w1_mean"], c["w1_mean_ci"]), ci(c["mmd"], c["mmd_ci"])] + \
+                [ci(*pc[k][:1], pc[k][1:]) for k in KEYS]
+        md.append(f"| {name} | " + " | ".join(cells) + " |")
+    if vm:
+        md += [""] + [f"- {n}: {vm} = {f(c['video_metric_over_real_baseline'])}x the real-vs-real baseline; CI disjoint from baseline: "
+                      f"{c['video_metric_ci_disjoint_from_baseline']}" for n, c in r["conditions"].items() if "video_metric_over_real_baseline" in c]
+    md += ["", "Per-sample AUROC (negatives = real half R, positives = condition; 0.5 = chance, larger score = more impossible):", "",
+           "| condition | " + " | ".join(E8_DIAG) + " |", "|---|" + "---|" * len(E8_DIAG)]
+    md += [f"| {n} | " + " | ".join(f(c["auroc_vs_real"][k]) for k in E8_DIAG) + " |" for n, c in r["conditions"].items() if "auroc_vs_real" in c]
+    return md
+
+
+def run_e8(tag="e8", B=200, smoke=False):
+    """Standalone E8 (real data only):  python -m cvpr27.benchmark --e8 [--tag e8]"""
+    from cvpr27.data import Norm, sensor_stats
+    out_dir = drive_root() / f"eval_{tag}"
+    if (out_dir / "e8.json").exists():
+        print(f"{out_dir}/e8.json exists: use a new --tag (nothing is overwritten)."); return json.loads((out_dir / "e8.json").read_text())
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    metric = None
+    if not smoke:
+        from cvpr27.videofeat import load_metric
+        metric = load_metric(dev)
+    held, norm = load_split("heldout"), Norm(sensor_stats(load_split("train")))
+    if smoke:
+        held = {k: (v[:256] if hasattr(v, "shape") else v) for k, v in held.items()}
+    t0 = time.time()
+    res = e8_time_reversal(held, norm, metric, B=10 if smoke else B, device=dev, n=64 if smoke else 1024)
+    res.update(git=git_info(), seconds=round(time.time() - t0, 1), device=str(dev))
+    atomic_json(out_dir / "e8.json", res)
+    md = e8_markdown(res)
+    new_path(out_dir / "e8.md").write_text("\n".join(md) + "\n")
+    print("\n".join(md))
+    return res
+
+
 if __name__ == "__main__":
-    run()
+    import sys
+    if "--e8" in sys.argv:
+        a = sys.argv
+        run_e8(a[a.index("--tag") + 1] if "--tag" in a else "e8", smoke="--smoke" in a)
+    else:
+        run()
