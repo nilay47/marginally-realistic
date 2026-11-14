@@ -129,6 +129,18 @@ def _fd(mu1, s1, mu2, s2):
     return float(((mu1 - mu2) ** 2).sum() + np.trace(s1) + np.trace(s2) - 2 * tr)
 
 
+def _fd_sym(mu_r, cov_r, sqrt_r, mu_g, cov_g, device):
+    """Same Frechet distance via the symmetric form tr sqrt(R^1/2 G R^1/2); eigvalsh (GPU if available) is much
+    faster than eigvals of the non-symmetric product, which matters for bootstrap/E6 loops on 2048-d features."""
+    M = sqrt_r @ cov_g @ sqrt_r
+    M = 0.5 * (M + M.T)
+    if str(device).startswith("cuda"):
+        ev = torch.linalg.eigvalsh(torch.from_numpy(M).to(device)).cpu().numpy()
+    else:
+        ev = np.linalg.eigvalsh(M)
+    return float(((mu_r - mu_g) ** 2).sum() + np.trace(cov_r) + np.trace(cov_g) - 2 * np.sqrt(np.clip(ev, 0, None)).sum())
+
+
 class VideoMetric:
     def __init__(self, kind: str, device, i3d_path=None, flavor: str | None = None):
         self.kind, self.device, self.flavor = kind, device, flavor
@@ -152,6 +164,8 @@ class VideoMetric:
         self.ref = {"feats": f}
         if self.kind == "fvd":
             self.ref["mu"], self.ref["cov"] = f.mean(0), np.cov(f, rowvar=False)
+            w, V = np.linalg.eigh(self.ref["cov"])
+            self.ref["sqrt_cov"] = (V * np.sqrt(np.clip(w, 0, None))) @ V.T
         else:
             self.ref["rr"] = self._kid_rr(f)
 
@@ -184,7 +198,8 @@ class VideoMetric:
         idx = np.arange(n) if idx is None else np.asarray(idx)
         if self.kind == "fvd":
             f = p["feats"][idx]
-            return _fd(self.ref["mu"], self.ref["cov"], f.mean(0), np.cov(f, rowvar=False))
+            return _fd_sym(self.ref["mu"], self.ref["cov"], self.ref["sqrt_cov"], f.mean(0),
+                           np.cov(f, rowvar=False), self.device)
         gg = p["gg"][np.ix_(idx, idx)]
         mask = idx[:, None] != idx[None, :]
         m = len(idx)
