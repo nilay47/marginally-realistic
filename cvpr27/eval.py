@@ -113,6 +113,32 @@ def bootstrap(ref, vd: VarData, arrays: dict, B: int, seed: int, m_sub: int, rec
     return stats
 
 
+# ------------------------------------------------------------------ E6 pooling over draws
+class Pooled:
+    def __init__(self, om, tau, n):
+        self.om, self.tau, self.n = om, tau, n
+
+
+def pool_draws(ref, norm, draws, arrs, names):
+    """Pool every available draw of each variant (E6 subsamples WITHOUT replacement from the pool, so n=1024 still varies
+    between subsets). Returns (data, arrays, info); uses whatever draws exist for a variant and records how many."""
+    data, arr, info = {}, {}, {}
+    for name in names:
+        ds = [d for d in range(len(draws)) if name in draws[d] and "per" in arrs[d][name]]
+        vds = [draws[d][name] for d in ds]
+        om, tau = np.concatenate([v.om for v in vds]), np.concatenate([v.tau for v in vds])
+        per = {k: np.concatenate([arrs[d][name]["per"][k] for d in ds]) for k in arrs[ds[0]][name]["per"]}
+        feats = np.concatenate([em.mmd_features(v.vid, v.om, v.tau, norm) for v in vds])
+        a = {"per": per, "pool": ref.mmd_pool(feats), "m": min(len(om), ref.n // 2)}
+        if ref.metric is not None and all("prep" in arrs[d][name] for d in ds):
+            f = np.concatenate([arrs[d][name]["prep"]["feats"] for d in ds])
+            a["prep"] = {"feats": f} if ref.metric.kind == "fvd" else \
+                {"feats": f, "gg": ref.metric._blocks(f, f), "gr": ref.metric._blocks(f, ref.metric.ref["feats"])}
+        data[name], arr[name] = Pooled(om, tau, len(om)), a
+        info[name] = {"draws_used": ds, "n_pooled": int(len(om))}
+    return data, arr, info
+
+
 # ------------------------------------------------------------------ E6: samples needed
 def e6(ref, data0: dict, arr0: dict, sizes, R: int, R_slow: int, seed: int) -> dict:
     """P(metric ranks the worse variant worse) when computed on n samples, over resamples. 0.5 = chance."""
@@ -244,18 +270,20 @@ def main(argv=None):
         print(f"  elapsed {fmt_s(time.time() - t0)}")
 
     # ---------------- metrics per (variant, draw)
-    prep_cache, recs, arr0 = {}, [], {}
+    prep_cache, recs, arr0, arrs = {}, [], {}, []
     for d, dd in enumerate(draws):
-        rec_d = {}
+        rec_d, arrs_d = {}, {}
         for name in VARIANTS:
             vd = dd[name]
             vsrc = {"joint": ("joint", d), "independent": ("vo", d), "cascaded": ("vo", d), "video_only": ("vo", d),
                     "shuffle_oracle": ("oracle", d)}.get(name)
             rec, arrays = evaluate_one(ref, vd, prep_cache, vsrc, want_arrays=d == 0)
             rec_d[name] = rec
+            arrs_d[name] = arrays
             if d == 0:
                 arr0[name] = arrays
         recs.append(rec_d)
+        arrs.append(arrs_d)
         print(f"draw {d} evaluated ({fmt_s(time.time() - t0)})")
 
     # ---------------- bootstrap (main draw) + floors
@@ -296,7 +324,8 @@ def main(argv=None):
                        "r_energy_win_max": c["metrics"]["physical"]["r_energy_win_max"]["median"]} for c in curve if "physical" in c["metrics"]]}
 
     # ---------------- E6, E7
-    e6res = e6(ref, draws[0], arr0, a.sizes, a.R, a.R_slow, seed=5)
+    pdata, parr, e6_pool = pool_draws(ref, norm, draws, arrs, ["joint", "independent", "cascaded"])
+    e6res = e6(ref, pdata, parr, a.sizes, a.R, a.R_slow, seed=5)
     print(f"E6 done ({fmt_s(time.time() - t0)})")
     e7res = e7(ref, draws[0], arr0, seed=6)
 
@@ -325,8 +354,8 @@ def main(argv=None):
            "floors": floors, "draws": recs, "bootstrap_ci_main_draw": boot, "spread_over_draws": spread,
            "ci_methods": {"per_sample (W1, physics medians)": "percentile bootstrap over generated samples, B=%d" % a.B,
                           "set_level (video metric, MMD)": em.SUBSAMPLE_METHOD, "m_sub": a.m_sub, "B": a.B,
-                          "E6": "subsets drawn without replacement"},
-           "E4_gaps": gaps, "E3_ratio_curve": e3, "E6_sample_efficiency": e6res, "E7_auroc": e7res, "E8_time_reversal": e8res,
+                          "E6": "subsets drawn without replacement from the draws pooled per variant (see E6_pooling)"},
+           "E4_gaps": gaps, "E3_ratio_curve": e3, "E6_sample_efficiency": e6res, "E6_pooling": e6_pool, "E7_auroc": e7res, "E8_time_reversal": e8res,
            "go_no_go": gng, "E2_curve_files": [str(jr.name)], "seconds": time.time() - t0}
     atomic_json(out_dir / "results.json", res)
     write_markdown(out_dir, res)
@@ -384,7 +413,9 @@ def write_markdown(out_dir: Path, r: dict):
     md += ["", "## E3 windowed/global ratio (ratio of medians), joint checkpoints vs real", "",
            f"real: {fmt(r['E3_ratio_curve']['real_ratio_of_medians'])}", "", "| step | n | win/glob | r_energy | win_max |", "|---|---|---|---|---|"]
     md += [f"| {c['step']} | {c['n']} | {fmt(c['ratio_of_medians'])} | {fmt(c['r_energy'])} | {fmt(c['r_energy_win_max'])} |" for c in r["E3_ratio_curve"]["by_step"]]
-    md += ["", "## E6 minimum n with P(correct ranking) >= 0.95 (None = never reached; 0.5 = chance)", ""]
+    md += ["", "## E6 minimum n with P(correct ranking) >= 0.95 (None = never reached; 0.5 = chance)", "",
+           "Subsets of size n are drawn WITHOUT replacement from the draws pooled per variant: " +
+           "; ".join(f"{k}: {v['n_pooled']} samples from draws {v['draws_used']}" for k, v in r["E6_pooling"].items()), ""]
     for k, d in r["E6_sample_efficiency"].items():
         md.append(f"- {k}: {d['min_n_for_p95']}")
     md += ["", "## E7 AUROC (real held-out = negatives; larger score = more impossible)", "", "| positives | " + " | ".join(PHYS + ["r_energy_win_med", "kin_rad_med"]) + " |", "|---|---|---|---|---|---|"]
