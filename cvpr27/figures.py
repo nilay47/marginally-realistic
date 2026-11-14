@@ -88,12 +88,15 @@ def fig_variants(res, d):
     B, R0 = res["bootstrap_ci_main_draw"], res["draws"][0]
 
     def sc(v, k):
-        if k in ("w1_mean", "psd_mean", "video_metric"):
+        if k == "video_metric":
+            st = B[v].get(k)
+            return None if st is None else st["subsample_median"]        # set-level: subsample median, equal m for all
+        if k in ("w1_mean", "psd_mean"):
             return R0[v].get(k)
         return R0[v]["physical"][k]["median"] if "physical" in R0[v] else None
 
     panels = [("w1_mean", "sensor W1 (lower = more realistic)", False),
-              ("video_metric", (res["video_metric"] or {}).get("name", "video"), False)] + [(k, t, True) for k, t in PHYS]
+              ("video_metric", (res["video_metric"] or {}).get("name", "video") + f" (median of m={res['args']['m_sub']} subsets)", False)] + [(k, t, True) for k, t in PHYS]
     panels = [p for p in panels if sc("joint", p[0]) is not None]
     fig, axs = plt.subplots(1, len(panels), figsize=(1.9 * len(panels), 2.7))
     for ax, (k, title, logy) in zip(np.atleast_1d(axs), panels):
@@ -101,7 +104,7 @@ def fig_variants(res, d):
             y = sc(v, k)
             if y is None:
                 continue
-            lo, hi = B[v][k]
+            lo, hi = B[v][k]["subsample_ci95"] if k == "video_metric" else B[v][k]
             ax.bar(i, y, 0.55, color=C[v], yerr=[[max(y - lo, 0)], [max(hi - y, 0)]],
                    error_kw={"lw": 0.8, "capsize": 2, "ecolor": INK2})
         if k in res["floors"]["median_and_ci"]:

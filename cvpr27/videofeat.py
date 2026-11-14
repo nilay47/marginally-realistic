@@ -212,6 +212,15 @@ class VideoMetric:
         m = len(idx)
         return float(gg[mask].sum() / mask.sum() + self.ref["rr"] - 2 * p["gr"][idx].mean())
 
+    def value_pair(self, p, gi, ri):
+        """Metric on generated subset gi vs reference subset ri (both without replacement, equal size).
+        FVD: exact Frechet distance of the two subsets. KID: unbiased, so only the generated side is subsampled
+        (reference kept whole); ri is ignored."""
+        if self.kind == "fvd":
+            from cvpr27.evalmetrics import frechet_svd
+            return frechet_svd(self.ref["feats"][np.asarray(ri)], p["feats"][np.asarray(gi)])
+        return self.value(p, gi)
+
     def score(self, gen_u8):
         return self.value(self.prep(gen_u8))
 

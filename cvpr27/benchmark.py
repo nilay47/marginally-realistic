@@ -126,17 +126,20 @@ def _ci(fn, n, B, rng):
     return [float(np.percentile(v, 2.5)), float(np.percentile(v, 97.5))]
 
 
-def e8_time_reversal(held, norm, metric=None, B=200, seed=8, device="cpu", n=1024) -> dict:
+def e8_time_reversal(held, norm, metric=None, B=200, seed=8, device="cpu", n=1024, m_sub=512) -> dict:
     """E8: does each metric detect CONSISTENT time reversal of real clips? Needs real data only (no trained models).
 
     Split the held-out set into disjoint halves A (n clips, source of the test clips) and R (reference, n clips).
     Conditions: real_A (baseline: real vs real), time_reversed, video_reversed_only. All compared with R, so every
     number has the same n and no clip is on both sides. FVD/KID, W1, MMD and the physics medians get 95% bootstrap
-    CIs over the test clips (B draws); AUROC is real R (negatives) vs the condition (positives). The video metric is
+    CIs over the test clips (B draws); set-level metrics (video metric, MMD) use SUBSAMPLING WITHOUT REPLACEMENT instead
+    (B subsets of m_sub from A and from R, the same m_sub for every condition incl. the baseline; the full-n point
+    estimate is reported separately); AUROC is real R (negatives) vs the condition (positives). The video metric is
     skipped when metric is None (CPU smoke test). The reference of `metric` is replaced here and restored on exit."""
     rng = np.random.default_rng(seed)
     perm = np.random.default_rng(seed).permutation(len(held["video"]))
     n = min(n, len(perm) // 2)
+    m_sub = min(m_sub, n)
     iA, iR = perm[:n], perm[n:2 * n]
     g = lambda i: (held["video"][i], held["omega"][i].astype(np.float64), held["tau"][i].astype(np.float64))
     real_R, real_A = g(iR), g(iA)
@@ -148,7 +151,8 @@ def e8_time_reversal(held, norm, metric=None, B=200, seed=8, device="cpu", n=102
     if metric is not None:
         old_ref = metric.ref
         metric.set_reference_nocache(real_R[0])
-    out = {"n": int(n), "B": B, "split": {"reference_R": "held-out half R", "test": "disjoint held-out half A (reversed or not)"},
+    out = {"n": int(n), "B": B, "m_subsample": int(m_sub), "set_level_ci_method": em.SUBSAMPLE_METHOD,
+           "per_sample_ci_method": "percentile bootstrap over test clips (physics medians, W1)", "split": {"reference_R": "held-out half R", "test": "disjoint held-out half A (reversed or not)"},
            "video_metric": None if metric is None else {"name": metric.name, "kind": metric.kind, "flavor": metric.flavor},
            "conditions": {}}
     try:
@@ -164,13 +168,12 @@ def e8_time_reversal(held, norm, metric=None, B=200, seed=8, device="cpu", n=102
             r["w1_mean_ci"] = _ci(lambda i: em.sensor_w1(real_R[1], real_R[2], om[i], tau[i])["w1_mean"], n, B, rng)
             pool = em.MMDPool(mmd_R, em.mmd_features(v, om, tau, norm), device)
             ar, ref_idx = np.arange(n), np.arange(n)
-            r["mmd"] = pool.mmd2(ar, ref_idx)
-            r["mmd_ci"] = _ci(lambda i: pool.mmd2(i, ref_idx), n, B, rng)
+            r["mmd"] = em.subsample_stat(lambda gi, ri: pool.mmd2(gi, ri), n, n, m_sub, B, rng, pool.mmd2(ar, ref_idx))
             if metric is not None:
                 p = metric.prep(v)
-                r["video_metric"] = float(metric.value(p))
-                em.check_finite("video_metric", r["video_metric"])
-                r["video_metric_ci"] = _ci(lambda i: metric.value(p, i), n, B, rng)
+                r["video_metric"] = em.subsample_stat(lambda gi, ri: metric.value_pair(p, gi, ri), n, n, m_sub, B, rng,
+                                                      metric.value(p))
+                em.check_finite("video_metric", r["video_metric"]["full_n_point"])
             if name != "real_vs_real":
                 r["auroc_vs_real"] = {k: em.auroc(per_R[k], per[k]) for k in E8_DIAG}
             out["conditions"][name] = r
@@ -181,8 +184,9 @@ def e8_time_reversal(held, norm, metric=None, B=200, seed=8, device="cpu", n=102
     if metric is not None:
         for name in ("time_reversed", "video_reversed_only"):
             c = out["conditions"][name]
-            c["video_metric_over_real_baseline"] = c["video_metric"] / max(base["video_metric"], 1e-12)
-            c["video_metric_ci_disjoint_from_baseline"] = bool(c["video_metric_ci"][0] > base["video_metric_ci"][1])
+            cv, bv = c["video_metric"], base["video_metric"]
+            c["video_metric_over_real_baseline_at_m"] = cv["subsample_median"] / max(bv["subsample_median"], 1e-12)
+            c["video_metric_ci_disjoint_from_baseline_at_m"] = bool(cv["subsample_ci95"][0] > bv["subsample_ci95"][1])
     return out
 
 
@@ -193,16 +197,24 @@ def e8_markdown(r: dict) -> list:
     md = ["## E8: consistent time reversal of real clips", "",
           f"Test clips: held-out half A (n={r['n']}), compared with the disjoint held-out half R. `real_vs_real` is the baseline "
           "(half A unmodified). `time_reversed`: frames reversed, gyro reversed and negated, torque reversed (all modalities consistent). "
-          f"`video_reversed_only`: video reversed, sensors forward. Values: point [95% bootstrap CI over test clips, B={r['B']}].", "",
+          f"`video_reversed_only`: video reversed, sensors forward. Values: point [95% percentile-bootstrap CI over test clips, B={r['B']}] for W1 and the physics diagnostics; "
+          f"for {vm or 'the video metric'} and MMD² the value is the median [2.5-97.5 percentile] over {r['B']} random subsets of m={r['m_subsample']} "
+          "drawn WITHOUT replacement from the test set and from the reference (same m for every row, incl. the baseline); "
+          "full-n point estimates are in a separate table.", "",
           "| condition | " + (f"{vm} | " if vm else "") + "W1 | MMD² | r_energy | win_max | kin_max (rad) |", "|---|" + "---|" * (5 + bool(vm))]
     for name, c in r["conditions"].items():
         pc = c["physical_ci"]
-        cells = ([ci(c["video_metric"], c["video_metric_ci"])] if vm else []) + [ci(c["w1_mean"], c["w1_mean_ci"]), ci(c["mmd"], c["mmd_ci"])] + \
+        sub = lambda d: ci(d["subsample_median"], d["subsample_ci95"])
+        cells = ([sub(c["video_metric"])] if vm else []) + [ci(c["w1_mean"], c["w1_mean_ci"]), sub(c["mmd"])] + \
                 [ci(*pc[k][:1], pc[k][1:]) for k in KEYS]
         md.append(f"| {name} | " + " | ".join(cells) + " |")
+    md += ["", f"Full-n point estimates (n={r['n']} vs n={r['n']}; NOT comparable with the m={r['m_subsample']} subsample values above, "
+           "FVD is biased upward at smaller n):", "", "| condition | " + (f"{vm} (full n) | " if vm else "") + "MMD² (full n) |", "|---|" + "---|" * (1 + bool(vm))]
+    md += [f"| {n} | " + (f"{f(c['video_metric']['full_n_point'])} | " if vm else "") + f"{f(c['mmd']['full_n_point'])} |" for n, c in r["conditions"].items()]
     if vm:
-        md += [""] + [f"- {n}: {vm} = {f(c['video_metric_over_real_baseline'])}x the real-vs-real baseline; CI disjoint from baseline: "
-                      f"{c['video_metric_ci_disjoint_from_baseline']}" for n, c in r["conditions"].items() if "video_metric_over_real_baseline" in c]
+        md += [""] + [f"- {n}: {vm} median = {f(c['video_metric_over_real_baseline_at_m'])}x the real-vs-real baseline at m={r['m_subsample']}; "
+                      f"subsample ranges disjoint from baseline: {c['video_metric_ci_disjoint_from_baseline_at_m']}"
+                      for n, c in r["conditions"].items() if "video_metric_over_real_baseline_at_m" in c]
     md += ["", "Per-sample AUROC (negatives = real half R, positives = condition; 0.5 = chance, larger score = more impossible):", "",
            "| condition | " + " | ".join(E8_DIAG) + " |", "|---|" + "---|" * len(E8_DIAG)]
     md += [f"| {n} | " + " | ".join(f(c["auroc_vs_real"][k]) for k in E8_DIAG) + " |" for n, c in r["conditions"].items() if "auroc_vs_real" in c]

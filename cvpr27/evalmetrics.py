@@ -145,3 +145,28 @@ def auroc(neg, pos) -> float:
     neg, pos = np.asarray(neg, float), np.asarray(pos, float)
     r = rankdata(np.concatenate([neg, pos]))
     return float((r[len(neg):].sum() - len(pos) * (len(pos) + 1) / 2) / (len(neg) * len(pos)))
+
+
+# ------------------------------------------------------------------ set-level metrics: subsampling
+def frechet_svd(fr, fg) -> float:
+    """Frechet distance between Gaussians fitted to two feature sets. Uses tr sqrt(Cr Cg) = sum of singular values of
+    Xr Xg^T (Xr, Xg = centred features / sqrt(n-1)), exact and only n x n, so it is cheap on every subsample."""
+    fr, fg = np.asarray(fr, np.float64), np.asarray(fg, np.float64)
+    mr, mg = fr.mean(0), fg.mean(0)
+    Xr, Xg = (fr - mr) / np.sqrt(len(fr) - 1), (fg - mg) / np.sqrt(len(fg) - 1)
+    sv = np.linalg.svd(Xr @ Xg.T, compute_uv=False)
+    return float(((mr - mg) ** 2).sum() + (Xr ** 2).sum() + (Xg ** 2).sum() - 2 * sv.sum())
+
+
+SUBSAMPLE_METHOD = ("subsampling WITHOUT replacement: B random subsets of m from the generated/test set and m from the reference set; "
+                    "median and 2.5-97.5 percentile range of the metric over subsets. Used for set-level metrics (FVD/KID, MMD) "
+                    "because bootstrap resampling duplicates clips and biases them. full_n_point is the full-sample estimate.")
+
+
+def subsample_stat(fn, n_gen, n_ref, m, B, rng, point) -> dict:
+    """fn(gen_idx, ref_idx) -> metric value on subsets of size m (without replacement). Equal m for every condition."""
+    assert m <= n_gen and m <= n_ref, (m, n_gen, n_ref)
+    v = np.array([fn(rng.choice(n_gen, m, replace=False), rng.choice(n_ref, m, replace=False)) for _ in range(B)])
+    return {"full_n_point": float(point), "subsample_median": float(np.median(v)),
+            "subsample_ci95": [float(np.percentile(v, 2.5)), float(np.percentile(v, 97.5))],
+            "m": int(m), "B": int(B), "method": "subsampling_without_replacement"}

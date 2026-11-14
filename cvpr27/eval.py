@@ -84,7 +84,9 @@ def scalars(rec) -> dict:
     return out
 
 
-def bootstrap(ref, vd: VarData, arrays: dict, B: int, seed: int) -> dict:
+def bootstrap(ref, vd: VarData, arrays: dict, B: int, seed: int, m_sub: int, rec: dict) -> dict:
+    """Per-sample metrics (W1, physics medians): percentile bootstrap. Set-level metrics (video metric, MMD): subsampling
+    without replacement (em.subsample_stat), m_sub from the generated set and m_sub from the reference set."""
     rng = np.random.default_rng(seed)
     n = vd.n
     stats = {}
@@ -98,13 +100,16 @@ def bootstrap(ref, vd: VarData, arrays: dict, B: int, seed: int) -> dict:
         run("w1_mean", lambda i: em.sensor_w1(ref.om, ref.tau, vd.om[i], vd.tau[i])["w1_mean"])
         run("psd_mean", lambda i: em.sensor_psd(ref.om, ref.tau, vd.om[i], vd.tau[i])["psd_mean"])
     if "prep" in arrays:
-        run("video_metric", lambda i: ref.metric.value(arrays["prep"], i))
+        n_ref = len(ref.metric.ref["feats"])
+        stats["video_metric"] = em.subsample_stat(lambda gi, ri: ref.metric.value_pair(arrays["prep"], gi, ri), n, n_ref,
+                                                  min(m_sub, n, n_ref), B, rng, rec["video_metric"])
     if "per" in arrays:
         per = arrays["per"]
         for k in PHYS + ["r_energy_win_med", "kin_rad_med"]:
             run(k, lambda i, k=k: np.median(per[k][i]))
         run("ratio_win_over_glob", lambda i: np.median(per["r_energy_win_max"][i]) / max(np.median(per["r_energy"][i]), 1e-12))
-        run("mmd", lambda i: arrays["pool"].mmd2(i, np.arange(arrays["m"])))
+        stats["mmd"] = em.subsample_stat(lambda gi, ri: arrays["pool"].mmd2(gi, ri), n, ref.n, min(m_sub, n, ref.n), B, rng,
+                                         rec["mmd"]["value"])
     return stats
 
 
@@ -118,7 +123,7 @@ def e6(ref, data0: dict, arr0: dict, sizes, R: int, R_slow: int, seed: int) -> d
         for n in sizes:
             if n > data0[better].n:
                 continue
-            gi = lambda: (rng.integers(0, data0[worse].n, n), rng.integers(0, data0[better].n, n))
+            gi = lambda: (rng.choice(data0[worse].n, n, replace=False), rng.choice(data0[better].n, n, replace=False))
             cell = {}
             for k in PHYS:
                 wins = []
@@ -136,7 +141,7 @@ def e6(ref, data0: dict, arr0: dict, sizes, R: int, R_slow: int, seed: int) -> d
             for _ in range(R):
                 a, b = gi()
                 m = arr0[worse]["m"]
-                r1, r2 = rng.integers(0, m, n), rng.integers(0, m, n)
+                r1, r2 = rng.choice(m, n, replace=False), rng.choice(m, n, replace=False)
                 wins.append(arr0[worse]["pool"].mmd2(a, r1) > arr0[better]["pool"].mmd2(b, r2))
             cell["mmd"] = float(np.mean(wins))
             if "prep" in arr0[worse] and "prep" in arr0[better]:
@@ -187,10 +192,11 @@ def get_args(argv=None):
     ap.add_argument("--sizes", type=int, nargs="+", default=[64, 128, 256, 512, 1024])
     ap.add_argument("--R", type=int, default=100)
     ap.add_argument("--R_slow", type=int, default=30)
+    ap.add_argument("--m_sub", type=int, default=512, help="subset size for set-level metrics (FVD, MMD): subsampling without replacement")
     ap.add_argument("--smoke", action="store_true")
     a = ap.parse_args(argv)
     if a.smoke:
-        a.n, a.B, a.R, a.R_slow, a.sample_batch, a.sizes = 16, 10, 8, 4, 16, [4, 8, 16]
+        a.n, a.B, a.R, a.R_slow, a.sample_batch, a.sizes, a.m_sub = 16, 10, 8, 4, 16, [4, 8, 16], 8
     return a
 
 
@@ -253,7 +259,7 @@ def main(argv=None):
         print(f"draw {d} evaluated ({fmt_s(time.time() - t0)})")
 
     # ---------------- bootstrap (main draw) + floors
-    boot = {name: bootstrap(ref, draws[0][name], arr0[name], a.B, seed=7 + i) for i, name in enumerate(VARIANTS)}
+    boot = {name: bootstrap(ref, draws[0][name], arr0[name], a.B, 7 + i, a.m_sub, recs[0][name]) for i, name in enumerate(VARIANTS)}
     rngf = np.random.default_rng(99)
     fl = {k: [float(np.median(ref.per[k]))] + pct([np.median(ref.per[k][rngf.integers(0, ref.n, ref.n)]) for _ in range(a.B)])
           for k in PHYS}
@@ -295,7 +301,8 @@ def main(argv=None):
     e7res = e7(ref, draws[0], arr0, seed=6)
 
     # ---------------- E8: consistent time reversal of REAL clips (real data only; reference of the metric is restored)
-    e8res = bm.e8_time_reversal(held, norm, metric, B=a.B, device=dev, n=64 if a.smoke else 1024)
+    e8res = bm.e8_time_reversal(held, norm, metric, B=a.B, device=dev, n=64 if a.smoke else 1024,
+                                m_sub=a.m_sub)
     print(f"E8 done ({fmt_s(time.time() - t0)})")
 
     # ---------------- go / no-go flags (spec section 6), computed
@@ -316,6 +323,9 @@ def main(argv=None):
            "video_metric": None if metric is None else {"name": metric.name, "kind": metric.kind, "flavor": metric.flavor},
            "runs": {k: {"run": m["run"], "ckpt": m["ckpt"]} for k, m in models.items()},
            "floors": floors, "draws": recs, "bootstrap_ci_main_draw": boot, "spread_over_draws": spread,
+           "ci_methods": {"per_sample (W1, physics medians)": "percentile bootstrap over generated samples, B=%d" % a.B,
+                          "set_level (video metric, MMD)": em.SUBSAMPLE_METHOD, "m_sub": a.m_sub, "B": a.B,
+                          "E6": "subsets drawn without replacement"},
            "E4_gaps": gaps, "E3_ratio_curve": e3, "E6_sample_efficiency": e6res, "E7_auroc": e7res, "E8_time_reversal": e8res,
            "go_no_go": gng, "E2_curve_files": [str(jr.name)], "seconds": time.time() - t0}
     atomic_json(out_dir / "results.json", res)
@@ -333,21 +343,33 @@ def write_markdown(out_dir: Path, r: dict):
             ("r_energy", "r_energy"), ("r_energy_win_max", "win_max"), ("kin_rad_max", "kin_max (rad)"),
             ("ratio_win_over_glob", "win/glob"), ("invalid_frame_frac", "invalid frames")]
     md = [f"# Results ({r['tag']})", "", f"Runs: {r['runs']}. 3 draws x {r['args']['n']} samples, 250-step ancestral. "
-          f"Main draw: point estimate [95% bootstrap CI, B={r['args']['B']}]. Spread: mean ± std (min–max) over {r['args']['draws']} draws.", "",
+          f"Main draw: point estimate [95% percentile-bootstrap CI, B={r['args']['B']}] for W1, PSD and the physics diagnostics (per-sample metrics). "
+          f"For {(r['video_metric'] or {}).get('name') or 'the video metric'} and MMD² (set-level) the cell is the MEDIAN [2.5-97.5 percentile] over "
+          f"{r['args']['B']} random subsets of m={r['args']['m_sub']} drawn WITHOUT replacement from the generated set and from the reference; "
+          "same m for every row. Full-n point estimates are in their own table, and the spread over draws also uses full-n values. "
+          f"Spread: mean ± std (min–max) over {r['args']['draws']} draws.", "",
           "## Main draw", "", "| variant | " + " | ".join(c[1] for c in cols) + " |", "|---|" + "---|" * len(cols)]
     for v in VARIANTS:
         row = []
         for k, _ in cols:
+            st = B[v].get(k)
+            if isinstance(st, dict):      # set-level metric: subsample median [range]; full-n point goes in its own table
+                row.append(f"{fmt(st['subsample_median'])} [{fmt(st['subsample_ci95'][0])}, {fmt(st['subsample_ci95'][1])}]")
+                continue
             val = r["draws"][0][v].get(k) if k in ("w1_mean", "psd_mean", "video_metric", "invalid_frame_frac") else \
                 (scalars(r["draws"][0][v]).get(k))
-            ci = B[v].get(k)
-            row.append("—" if val is None else fmt(val) + (f" [{fmt(ci[0])}, {fmt(ci[1])}]" if ci else ""))
+            row.append("—" if val is None else fmt(val) + (f" [{fmt(st[0])}, {fmt(st[1])}]" if st else ""))
         md.append(f"| {v} | " + " | ".join(row) + " |")
     f = r["floors"]["median_and_ci"]
     md.append(f"| real data (floor) | | | | | {fmt(f['r_energy'][0])} [{fmt(f['r_energy'][1])}, {fmt(f['r_energy'][2])}] | "
               f"{fmt(f['r_energy_win_max'][0])} [{fmt(f['r_energy_win_max'][1])}, {fmt(f['r_energy_win_max'][2])}] | "
               f"{fmt(f['kin_rad_max'][0])} [{fmt(f['kin_rad_max'][1])}, {fmt(f['kin_rad_max'][2])}] | {fmt(r['floors']['summary']['ratio_of_medians_win_over_glob'])} | "
               f"{fmt(r['floors']['summary']['invalid_frame_frac'])} |")
+    fvn = (r["video_metric"] or {}).get("name") or "video metric"
+    md += ["", f"## Full-n point estimates of the set-level metrics (n={r['args']['n']} generated vs the held-out set; not comparable with the m={r['args']['m_sub']} cells)", "",
+           f"| variant | {fvn} | MMD² |", "|---|---|---|"]
+    for v in VARIANTS:
+        md.append(f"| {v} | " + " | ".join(("—" if B[v].get(k) is None else fmt(B[v][k]["full_n_point"])) for k in ("video_metric", "mmd")) + " |")
     md += ["", "## Spread over draws (mean ± std, min–max)", "", "| variant | " + " | ".join(c[1] for c in cols) + " |", "|---|" + "---|" * len(cols)]
     for v in VARIANTS:
         row = []
