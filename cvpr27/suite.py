@@ -29,7 +29,7 @@ class Reference:
         self._mmd_cache = pool.real_cache()
         return pool
 
-    def evaluate(self, v_u8=None, om=None, tau=None, mmd=True) -> dict:
+    def evaluate(self, v_u8=None, om=None, tau=None, mmd=True, use_metric=True) -> dict:
         """Any subset of modalities. Returns a flat JSON-able dict; every number computed here."""
         out = {}
         if om is not None:
@@ -37,7 +37,7 @@ class Reference:
             for k in ("w1_mean", "psd_mean"):
                 em.check_finite(k, out[k])
         if v_u8 is not None:
-            if self.metric is not None:
+            if self.metric is not None and use_metric:
                 out["video_metric"] = {"name": self.metric.name, "value": float(self.metric.score(v_u8)),
                                        "n": int(len(v_u8))}
                 em.check_finite("video_metric", out["video_metric"]["value"])

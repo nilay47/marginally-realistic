@@ -1,7 +1,7 @@
 """
 Cosine-schedule eps-prediction diffusion over (video, sensors) pairs (spec 2.4).
 
-  loss      : MSE(video eps) + MSE(sensor eps, readout = spatial mean)  (equal weight on the two means)
+  loss      : MSE(video eps) + sens_w * MSE(sensor eps, readout = spatial mean)  (sens_w=1: equal weight; v2 runs use 10)
   sample    : mode="ancestral" (250 steps, final samples) or "ddim" (50 steps, checkpoint evals)
   cond_video: replacement sampling for `cascaded` -- at every reverse step the video channel is
               overwritten with a q-sample of the GIVEN video at the current noise level, and the
@@ -41,7 +41,7 @@ class Diffusion:
         return self._bc(self.sqrt_ac, t, x0) * x0 + self._bc(self.sqrt_1mac, t, x0) * noise
 
     # ------------------------------------------------------------------ training
-    def loss(self, variant: Variant, model, v, s):
+    def loss(self, variant: Variant, model, v, s, sens_w: float = 1.0):
         b = (v if v is not None else s).shape[0]
         dev = (v if v is not None else s).device
         t = torch.randint(0, self.T, (b,), device=dev)
@@ -56,7 +56,7 @@ class Diffusion:
         if variant.has_video:
             parts["loss_video"] = F.mse_loss(ev_h, ev); tot = tot + parts["loss_video"]
         if variant.has_sens:
-            parts["loss_sens"] = F.mse_loss(es_h, es); tot = tot + parts["loss_sens"]
+            parts["loss_sens"] = F.mse_loss(es_h, es); tot = tot + sens_w * parts["loss_sens"]
         return tot, {k: float(x.detach()) for k, x in parts.items()}
 
     # ------------------------------------------------------------------ sampling

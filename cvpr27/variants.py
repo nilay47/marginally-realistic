@@ -20,6 +20,9 @@ def load_ema(run_name: str, dev):
     if not (run / "log.json").exists():
         raise FileNotFoundError(f"{run_name} has no log.json: training not finished")
     cfg = json.loads((run / "config.json").read_text())
+    t_run = cfg.get("pv", {}).get("T")
+    if t_run is not None and t_run != pv.T:
+        raise RuntimeError(f"{run_name} was trained with T={t_run} but this process has PV_T={pv.T}: export PV_T={t_run} (and PV_DT/PV_WIN) before running")
     final = json.loads((run / "log.json").read_text())["final_ema"]
     ck = torch.load(run / final, map_location=dev)
     a = cfg["args"]

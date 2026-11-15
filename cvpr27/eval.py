@@ -219,8 +219,14 @@ def get_args(argv=None):
     ap.add_argument("--R", type=int, default=100)
     ap.add_argument("--R_slow", type=int, default=30)
     ap.add_argument("--m_sub", type=int, default=512, help="subset size for set-level metrics (FVD, MMD): subsampling without replacement")
+    ap.add_argument("--suffix", default=None, help="evaluate the <variant>_<suffix> runs (e.g. v2 -> joint_v2, video_only_v2, sensor_only_v2); "
+                    "export PV_T/PV_DT/PV_WIN of those runs first (v2: PV_T=32)")
     ap.add_argument("--smoke", action="store_true")
     a = ap.parse_args(argv)
+    if a.suffix:
+        a.joint_run, a.video_run, a.sensor_run = (f"{v}_{a.suffix}" for v in ("joint", "video_only", "sensor_only"))
+        if a.tag == "main":
+            a.tag = a.suffix
     if a.smoke:
         a.n, a.B, a.R, a.R_slow, a.sample_batch, a.sizes, a.m_sub = 16, 10, 8, 4, 16, [4, 8, 16], 8
     return a

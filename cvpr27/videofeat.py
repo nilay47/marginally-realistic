@@ -153,7 +153,8 @@ class VideoMetric:
 
     # ---- reference
     def set_reference(self, real_u8):
-        key = _cache() / f"vidfeat_{self.kind}{self.flavor or ''}_heldout{len(real_u8)}.npy"
+        tt = "" if real_u8.shape[1] == 64 else f"_T{real_u8.shape[1]}"      # T=64 keeps its existing cache file name
+        key = _cache() / f"vidfeat_{self.kind}{self.flavor or ''}_heldout{len(real_u8)}{tt}.npy"
         if key.exists():
             f = np.load(key)
         else:

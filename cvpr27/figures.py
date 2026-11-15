@@ -158,7 +158,12 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", default="main")
     ap.add_argument("--joint_run", default="joint_s0")
+    ap.add_argument("--suffix", default=None, help="v2 -> joint run joint_v2 and (default) tag v2")
     a = ap.parse_args(argv)
+    if a.suffix:
+        a.joint_run = f"joint_{a.suffix}"
+        if a.tag == "main":
+            a.tag = a.suffix
     out = drive_root() / f"eval_{a.tag}"
     res = json.loads((out / "results.json").read_text())
     d = out / "figures"
