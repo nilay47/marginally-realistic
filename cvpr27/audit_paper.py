@@ -37,8 +37,10 @@ from cvpr27 import physvid as pv
 from cvpr27.common import atomic_json, drive_root, fmt_s, git_info, new_path
 from cvpr27.data import Norm, sensor_stats
 
-FVD_ORDER = ["real_vs_real", "time_reversed", "video_reversed_only", "gravity=1.1", "damping=0.0", "lag=4", "torque_gain=1.25", "gravity=1.25",
-             "damping=4.0", "gravity=0.9", "lag=1", "damping=2.0", "torque_gain=1.1"]
+FVD_ORDER = ["real_vs_real", "time_reversed", "video_reversed_only", "gravity=1.1", "damping=0.0", "lag=4", "gravity=1.25",
+             "damping=4.0", "gravity=0.9", "damping=2.0"]
+# FVD deliberately NOT computed: torque_gain=* (video bit-identical to the real test clips, FVD = baseline by construction; the report marks it)
+# and lag=1 (same real frames as lag=4, shifted by 1 instead of 4 frames; only the larger shift is measured)
 FVD_SET = {"gravity=0.9", "gravity=1.1", "gravity=1.25", "damping=0.0", "damping=2.0", "damping=4.0", "torque_gain=1.1", "torque_gain=1.25",
            "lag=1", "lag=4", "real_vs_real", "time_reversed", "video_reversed_only"}
 SEED_REF, SEED_TEST, SEED_NORM, N_NORM = 1, 2, 0, 10_000
@@ -242,6 +244,40 @@ def run_fvd(a):
               f"full-n {st['full_n_point']:.4g} ({fmt_s(time.time()-t0)})", flush=True)
 
 
+def run_fvd_gen(a):
+    """FVD of trained-model samples against the SAME n_fvd-clip reference R[:n_fvd], same n_fvd and m_sub as the audit conditions.
+    Expects <PHYSGEN_ROOT>/gen_samples/<run>/samples_final.npz (the run's final samples, copied from Drive: <run>/samples_final.npz) for each run in
+    --runs. Uses the FIRST n_fvd clips (samples are i.i.d.). Writes fvd/gen_<run>.json (resumable, never overwrites)."""
+    t0 = time.time()
+    root, R = setup(a)
+    out = out_dir_of(a)
+    fd = out / "fvd"
+    fd.mkdir(exist_ok=True)
+    metric = i3d_metric(get_device())
+    metric.device = torch.device("cpu")
+    cache = root / "i3d_feats" / f"ref_n{a.n_fvd}_T{pv.T}.npy"
+    metric._install_ref(np.load(cache) if cache.exists() else metric.ext.features(R["video"][:a.n_fvd]))
+    rng = np.random.default_rng(43)
+    for run in a.runs:
+        p = fd / f"gen_{run}.json"
+        src = drive_root() / "gen_samples" / run / "samples_final.npz"
+        if p.exists():
+            print(f"{run}: exists"); continue
+        z = np.load(src)
+        v = z["video"]
+        assert v.dtype == np.uint8 and v.ndim == 4 and v.shape[1] == pv.T and v.shape[2:] == (pv.H, pv.W) and len(v) >= a.n_fvd, (src, v.shape, v.dtype)
+        v = v[:a.n_fvd]
+        f = metric.ext.features(v)
+        pr = {"feats": f}
+        st = em.subsample_stat(lambda gi, ri: metric.value_pair(pr, gi, ri), a.n_fvd, a.n_fvd, a.m_sub, a.B, rng, metric.value(pr))
+        st.update(n_fvd=int(a.n_fvd), condition=f"gen:{run}", run=run, source=str(src), n_in_file=int(len(z["video"])), flavor="pytorchvideo I3D-R50 224x224",
+                  seconds=time.time() - t0)
+        em.check_finite("fvd", st["full_n_point"])
+        atomic_json(p, st)
+        print(f"{run}: FVD median {st['subsample_median']:.4g} [{st['subsample_ci95'][0]:.4g}, {st['subsample_ci95'][1]:.4g}] full-n {st['full_n_point']:.4g} "
+              f"(n={a.n_fvd}, m={a.m_sub}) ({fmt_s(time.time()-t0)})", flush=True)
+
+
 def run_report(a):
     """Merge results_fast.json + whatever FVD files exist -> results_audit.json/.md + Fig A/B (missing FVD marked). Re-runnable: writes a
     timestamped copy if the files already exist (nothing is overwritten)."""
@@ -253,9 +289,16 @@ def run_report(a):
     for grp in ("R3", "R2", "extra"):
         for k, c in res[grp]["conditions"].items():
             c["fvd"] = have.get(k)
+    root = drive_root() / "audit_cache"
+    base_v = cond_data("real_vs_real", a.n, root)["video"]
+    for k in ("torque_gain=0.9", "torque_gain=1.1", "torque_gain=1.25"):          # video must be identical to the real test clips
+        if k in res["R3"]["conditions"] and "real_vs_real" in have and np.array_equal(cond_data(k, a.n, root)["video"], base_v):
+            res["R3"]["conditions"][k]["fvd"] = {**have["real_vs_real"], "condition": k, "by_construction": "video identical to real_vs_real: FVD equals the baseline, not separately computed"}
     res["video_metric"] = {"name": "FVD", "flavor": "pytorchvideo I3D-R50 (Kinetics-400), 224x224; NOT comparable to published FVD"}
-    res["fvd_available"] = sorted(have)
+    res["generated_models_fvd"] = {k: v for k, v in have.items() if k.startswith("gen:")}
+    res["fvd_available"] = sorted(k for k in have if not k.startswith("gen:"))
     res["fvd_missing"] = [k for k in FVD_ORDER if k not in have]
+    res["fvd_skipped_by_design"] = {"torque_gain=*": "video identical to real: = baseline by construction (reported as such)", "lag=1": "only lag=4 measured"}
     sfx = "" if not (out / "results_audit.json").exists() else f"_{int(time.time())}"
     atomic_json(out / f"results_audit{sfx}.json", res)
     new_path(out / f"results_audit{sfx}.md").write_text("\n".join(markdown(res)) + "\n")
@@ -265,18 +308,19 @@ def run_report(a):
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["fast", "fvd", "report", "time"], help="fast: all non-FVD results; fvd: resumable FVD in priority order; report: merge + figures; time: I3D timing only")
+    ap.add_argument("mode", choices=["fast", "fvd", "fvd_gen", "report", "time"], help="fast: all non-FVD results; fvd: resumable FVD in priority order; report: merge + figures; time: I3D timing only")
     ap.add_argument("--n", type=int, default=512)
     ap.add_argument("--n_fvd", type=int, default=256)
     ap.add_argument("--m_sub", type=int, default=128)
     ap.add_argument("--B", type=int, default=200)
     ap.add_argument("--tag", default="audit")
+    ap.add_argument("--runs", nargs="+", default=["joint_v2", "video_only_v2"], help="fvd_gen: runs whose samples_final.npz sit in <root>/gen_samples/<run>/")
     ap.add_argument("--smoke", action="store_true")
     a = ap.parse_args(argv)
     if a.smoke:
         a.n, a.n_fvd, a.m_sub, a.B = 16, 8, 4, 6
     print(f"device: {get_device()} | PHYSGEN_ROOT={drive_root()}", flush=True)
-    {"fast": run_fast, "fvd": run_fvd, "report": run_report}.get(a.mode, lambda a: None)(a)
+    {"fast": run_fast, "fvd": run_fvd, "fvd_gen": run_fvd_gen, "report": run_report}.get(a.mode, lambda a: None)(a)
 
 
 # ------------------------------------------------------------------ report
@@ -307,6 +351,10 @@ def markdown(r):
     base = r["R3"]["conditions"]["real_vs_real"]
     md += ["", "## R2 consistent time reversal of real clips (baseline = real_vs_real above)", ""] + head + \
           [row("real_vs_real", base)] + [row(k, c) for k, c in r["R2"]["conditions"].items()]
+    if r.get("generated_models_fvd"):
+        md += ["", "## Trained models (same reference, n and m as the audit conditions)", "", "| model | FVD median [2.5-97.5] | full-n |", "|---|---|---|"] + \
+              [f"| {k[4:]} | {_f(v['subsample_median'])} [{_f(v['subsample_ci95'][0])}, {_f(v['subsample_ci95'][1])}] | {_f(v['full_n_point'])} |"
+               for k, v in r["generated_models_fvd"].items()]
     if r.get("extra", {}).get("conditions"):
         md += ["", "## Extra corruptions (same setup; FVD not computed)", ""] + head + [row(k, c) for k, c in r["extra"]["conditions"].items()]
     bf = base["fvd"]["subsample_median"] if base["fvd"] else None
