@@ -96,6 +96,32 @@ def conditions(n):
     return out
 
 
+def clean_features(ext, v, batch=4, name="", log=print):
+    """I3D features with a batch-integrity check. On MPS an occasional batch comes back corrupted (observed: 8 consecutive clips with feature
+    distances ~8x the set median, which differ from a fresh extraction by up to ~2.8 per dimension). A batch whose rows are, as a block, far from
+    the set median is re-extracted until two extractions agree, and the agreeing result is used. Flagged batches are logged."""
+    f = ext.features(v, batch=batch)
+    return repair_features(ext, v, f, batch, name, log)
+
+
+def repair_features(ext, v, f, batch, name="", log=print, ratio=2.5):
+    d = np.linalg.norm(f - np.median(f, 0), axis=1)
+    base = np.median(d)
+    bad = [s for s in range(0, len(f), batch) if np.median(d[s:s + batch]) > ratio * base]
+    for s in bad:
+        prev, g = f[s:s + batch], None
+        for _ in range(4):
+            g = ext.features(v[s:s + batch], batch=batch)
+            if np.abs(g - prev).max() < 1e-3:
+                break
+            prev = g
+        else:
+            raise RuntimeError(f"{name}: batch at {s} never stabilised")
+        log(f"  [integrity] {name}: batch {s}-{s+len(g)-1} re-extracted (max change {np.abs(g - f[s:s + batch]).max():.3g})")
+        f[s:s + batch] = g
+    return f
+
+
 def get_device():
     return torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
 
@@ -224,7 +250,7 @@ def run_fvd(a):
         p = feats_dir / f"{name.replace('=', '')}_n{len(v)}_T{pv.T}.npy"
         if p.exists():
             return np.load(p)
-        f = metric.ext.features(v)
+        f = clean_features(metric.ext, v, 4, name)
         np.save(p.with_suffix(".tmp.npy"), f); p.with_suffix(".tmp.npy").rename(p)
         return f
     metric._install_ref(feats("ref", R["video"][:a.n_fvd]))
@@ -234,6 +260,8 @@ def run_fvd(a):
         p = fd / f"{name.replace('=', '')}.json"
         if p.exists():
             print(f"[{i+1}/{len(FVD_ORDER)}] {name}: exists"); continue
+        if a.cached_only and not (feats_dir / f"{name.replace('=', '')}_n{a.n_fvd}_T{pv.T}.npy").exists():
+            print(f"[{i+1}/{len(FVD_ORDER)}] {name}: features not cached, skipped (--cached_only)"); continue
         v = cond_data(name, a.n, root)["video"][:a.n_fvd]
         pr = {"feats": feats(name, v)}
         st = em.subsample_stat(lambda gi, ri: metric.value_pair(pr, gi, ri), a.n_fvd, a.n_fvd, a.m_sub, a.B, rng, metric.value(pr))
@@ -256,7 +284,7 @@ def run_fvd_gen(a):
     metric = i3d_metric(get_device())
     metric.device = torch.device("cpu")
     cache = root / "i3d_feats" / f"ref_n{a.n_fvd}_T{pv.T}.npy"
-    metric._install_ref(np.load(cache) if cache.exists() else metric.ext.features(R["video"][:a.n_fvd]))
+    metric._install_ref(np.load(cache) if cache.exists() else clean_features(metric.ext, R["video"][:a.n_fvd], 4, "ref"))
     rng = np.random.default_rng(43)
     for run in a.runs:
         p = fd / f"gen_{run}.json"
@@ -267,7 +295,12 @@ def run_fvd_gen(a):
         v = z["video"]
         assert v.dtype == np.uint8 and v.ndim == 4 and v.shape[1] == pv.T and v.shape[2:] == (pv.H, pv.W) and len(v) >= a.n_fvd, (src, v.shape, v.dtype)
         v = v[:a.n_fvd]
-        f = metric.ext.features(v)
+        fp = root / "i3d_feats" / f"gen_{run}_n{a.n_fvd}_T{pv.T}.npy"
+        if fp.exists():
+            f = np.load(fp)
+        else:
+            f = clean_features(metric.ext, v, 4, f"gen:{run}")
+            np.save(fp.with_suffix(".tmp.npy"), f); fp.with_suffix(".tmp.npy").rename(fp)
         pr = {"feats": f}
         st = em.subsample_stat(lambda gi, ri: metric.value_pair(pr, gi, ri), a.n_fvd, a.n_fvd, a.m_sub, a.B, rng, metric.value(pr))
         st.update(n_fvd=int(a.n_fvd), condition=f"gen:{run}", run=run, source=str(src), n_in_file=int(len(z["video"])), flavor="pytorchvideo I3D-R50 224x224",
@@ -303,7 +336,7 @@ def run_report(a):
     atomic_json(out / f"results_audit{sfx}.json", res)
     new_path(out / f"results_audit{sfx}.md").write_text("\n".join(markdown(res)) + "\n")
     figures(res, out, sfx.lstrip("_") + ("_" if sfx else ""))
-    print(f"report written (FVD available: {len(have)}/{len(FVD_ORDER)}; missing: {res['fvd_missing']})")
+    print(f"report written (FVD available: {len(res['fvd_available'])}/{len(FVD_ORDER)} audit conditions + {len(res['generated_models_fvd'])} models; missing: {res['fvd_missing']})")
 
 
 def main(argv=None):
@@ -315,6 +348,7 @@ def main(argv=None):
     ap.add_argument("--B", type=int, default=200)
     ap.add_argument("--tag", default="audit")
     ap.add_argument("--runs", nargs="+", default=["joint_v2", "video_only_v2"], help="fvd_gen: runs whose samples_final.npz sit in <root>/gen_samples/<run>/")
+    ap.add_argument("--cached_only", action="store_true", help="fvd: only conditions whose I3D features are already cached")
     ap.add_argument("--smoke", action="store_true")
     a = ap.parse_args(argv)
     if a.smoke:
@@ -378,7 +412,7 @@ def figures(res, d, prefix=""):
     conds = res["R3"]["conditions"]
     base = conds["real_vs_real"]
     series = [("FVD", lambda c: c["fvd"]["subsample_median"] if c["fvd"] else float("nan"), "#2a78d6", "o"), ("W1 (mean)", lambda c: c["w1"]["w1_mean"], "#eb6834", "s"),
-              ("MMD²", lambda c: c["mmd"]["subsample_median"], "#1baf7a", "^"),
+              ("MMD² (÷ real 97.5th pct, floor 0.1)", lambda c: c["mmd"]["subsample_median"], "#1baf7a", "^"),
               ("r_energy", lambda c: c["physical"]["r_energy"]["median"], "#6250d6", "D"),
               ("kin mismatch", lambda c: c["physical"]["kin_rad_max"]["median"], "#e87ba4", "v")]
     fig, axs = plt.subplots(1, 4, figsize=(9.0, 2.7), sharey=True)
@@ -392,17 +426,21 @@ def figures(res, d, prefix=""):
             if lab == "FVD" and base["fvd"] is None:
                 continue
             b = max(f(base), 1e-12)
+            if lab.startswith("MMD"):         # unbiased MMD^2 is ~0 (and can be negative) for real-vs-real: use the baseline's 97.5th percentile as the noise ceiling
+                b = max(base["mmd"]["subsample_ci95"][1], 1e-12)
             ok = [(x, v) for x, v in zip(xs, vs) if lab != "FVD" or conds[f"{name}={v}"]["fvd"] is not None]
             xx = [x0] + [x for x, _ in ok]
-            yy = [1.0] + [max(f(conds[f"{name}={v}"]) / b, 1e-3) for _, v in ok]
+            fl = 0.1 if lab.startswith("MMD") else 1e-3          # MMD²: within-noise values (<= 0.1 x ceiling, or negative) sit on one flat floor
+            yy = [max(f(base) / b, fl) if lab.startswith("MMD") else 1.0] + [max(f(conds[f"{name}={v}"]) / b, fl) for _, v in ok]
             o = np.argsort(xx)
             ax.plot(np.array(xx)[o], np.array(yy)[o], color=col, marker=mk, label=lab + (" (n=%d)" % res["args"]["n_fvd"] if lab == "FVD" else ""))
         ax.axhline(1, color=INK2, lw=0.6, ls=":")
         ax.set_yscale("log")
         ax.set_xlabel("lag (frames)" if name == "lag" else f"{label.split(' x')[0]} error (factor - 1)")
         ax.set_title(name.replace("_", " "))
-    axs[0].set_ylabel("metric / real-vs-real baseline (log)")
-    axs[0].legend(fontsize=6.5, loc="upper center", ncol=1)
+    axs[0].set_ylabel("metric / real-vs-real baseline (log)\nMMD²: / baseline 97.5th pct")
+    h, l = axs[0].get_legend_handles_labels()
+    fig.legend(h, l, fontsize=6.5, loc="lower center", ncol=5, bbox_to_anchor=(0.5, -0.1))
     if base["fvd"] is None:
         axs[0].text(0.02, 0.02, "FVD not computed yet", transform=axs[0].transAxes, fontsize=6.5, color=INK2)
     save(fig, d, f"{prefix}fig_audit_A")
